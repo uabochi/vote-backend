@@ -22,7 +22,9 @@ mongoose
 app.post("/login", async (req, res) => {
   const { username } = req.body;
 
-  const user = await User.findOne({ username });
+  const user = await User.findOne({
+     username: username.toUpperCase(),
+  });
 
   if (!user) return res.status(400).json({ message: "User not found" });
 
@@ -35,6 +37,20 @@ app.post("/login", async (req, res) => {
 app.get("/candidates", async (req, res) => {
   const candidates = await Candidate.find();
   res.json(candidates);
+});
+
+/* ==============================
+   CHECK IF ALREADY VOTED FOR POSITION
+================================= */
+app.get("/vote-check", async (req, res) => {
+  const { username, position } = req.query;
+
+  try {
+    const vote = await Vote.findOne({ username, position });
+    res.json({ voted: !!vote }); // true if vote exists, false otherwise
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 /* ===========================
@@ -50,6 +66,10 @@ app.post("/vote", async (req, res) => {
 
   const vote = new Vote({ username, position, candidate });
   await vote.save();
+
+  // Emit real-time update
+  const votes = await Vote.find();
+  io.emit("voteUpdated", votes);
 
   res.json({ message: "Vote casted successfully" });
 });
@@ -78,6 +98,11 @@ app.get("/results", async (req, res) => {
 =========================== */
 app.delete("/vote/:id", async (req, res) => {
   await Vote.findByIdAndDelete(req.params.id);
+
+  // Emit real-time update
+  const votes = await Vote.find();
+  io.emit("voteUpdated", votes);
+
   res.json({ message: "Vote removed" });
 });
 
@@ -112,4 +137,18 @@ app.delete("/users/:id", async (req, res) => {
   res.json({ message: "User deleted" });
 });
 
-app.listen(5000, () => console.log("Server running on port 5000"));
+// app.listen(5000, () => console.log("Server running on port 5000"));
+
+const http = require("http");
+const { Server } = require("socket.io");
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" },
+});
+
+const PORT = process.env.PORT || 5000;
+
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
