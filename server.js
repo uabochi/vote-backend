@@ -16,19 +16,67 @@ mongoose
   .then(() => console.log("MongoDB Connected"))
   .catch((err) => console.log(err));
 
+const http = require("http");
+const { Server } = require("socket.io");
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" },
+});
+
+const PORT = process.env.PORT || 5000;
+
+// ================= VOTING SESSION CONTROL =================
+let votingActive = false;
+let countdown = 0;
+let timerInterval = null;
+
+// GENERATE PASSWORD
+function generatePassword(length = 14) {
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+";
+
+  let password = "";
+  for (let i = 0; i < length; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+
+  return password;
+}
+
 /* ===========================
    LOGIN
 =========================== */
 app.post("/login", async (req, res) => {
-  const { username } = req.body;
+  try {
+    const { username, password } = req.body;
 
-  const user = await User.findOne({
-     username: username.toUpperCase(),
-  });
+    if (!username || !password) {
+      return res.status(400).json({ message: "Username and password required" });
+    }
 
-  if (!user) return res.status(400).json({ message: "User not found" });
+    const user = await User.findOne({
+      username: username.toUpperCase(),
+    });
 
-  res.json(user);
+    if (!user) {
+      return res.status(400).json({ message: "User not found" });
+    }
+
+    if (password !== user.password) {
+      return res.status(400).json({ message: "Invalid password" });
+    }
+
+    res.json({
+      _id: user._id,
+      username: user.username,
+      role: user.role,
+    });
+
+  } catch (err) {
+    console.error("LOGIN ERROR:", err);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 /* ===========================
@@ -57,6 +105,10 @@ app.get("/vote-check", async (req, res) => {
    CAST VOTE
 =========================== */
 app.post("/vote", async (req, res) => {
+  if (!votingActive) {
+    return res.status(400).json({ message: "Voting is not active" });
+  }
+
   const { username, position, candidate } = req.body;
 
   const existingVote = await Vote.findOne({ username, position });
@@ -116,11 +168,44 @@ app.get("/users", async (req, res) => {
   res.json(users);
 });
 
-// Add user
+// Create user
 app.post("/users", async (req, res) => {
-  const user = new User(req.body);
-  await user.save();
-  res.json(user);
+  try {
+    const { username, role } = req.body;
+
+    if (!username) {
+      return res.status(400).json({ message: "Username is required" });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({
+      username: username.toUpperCase(),
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ message: "User already exists" });
+    }
+
+    // Generate password
+    const plainPassword = generatePassword();
+
+    // Create user
+    const newUser = new User({
+      username: username.toUpperCase(),
+      password: plainPassword,
+      role: role || "voter",
+    });
+
+    await newUser.save();
+
+    res.json({
+      message: "User created successfully",
+      generatedPassword: plainPassword, // send only once
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 // Edit user
@@ -137,17 +222,62 @@ app.delete("/users/:id", async (req, res) => {
   res.json({ message: "User deleted" });
 });
 
-// app.listen(5000, () => console.log("Server running on port 5000"));
+// Start voting with timer
+app.post("/start-voting", (req, res) => {
+  const { duration } = req.body; // duration in seconds
 
-const http = require("http");
-const { Server } = require("socket.io");
+  if (votingActive) {
+    return res.status(400).json({ message: "Voting already active" });
+  }
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
+  votingActive = true;
+  countdown = duration;
+
+  io.emit("voting-status", { votingActive, countdown });
+
+  timerInterval = setInterval(() => {
+    countdown--;
+
+    io.emit("timer-update", { countdown });
+
+    if (countdown <= 0) {
+      clearInterval(timerInterval);
+      votingActive = false;
+      io.emit("voting-ended");
+    }
+  }, 1000);
+
+  res.json({ message: "Voting started" });
 });
 
-const PORT = process.env.PORT || 5000;
+// Stop voting
+app.post("/stop-voting", (req, res) => {
+
+  if (!votingActive) {
+    return res.status(400).json({ message: "Voting is not active" });
+  }
+
+  // Stop the timer
+  clearInterval(timerInterval);
+
+  // Reset values
+  votingActive = false;
+  countdown = 0;
+
+  // Notify all connected clients
+  io.emit("voting-status", { votingActive, countdown });
+  io.emit("voting-ended");
+
+  res.json({ message: "Voting stopped successfully" });
+});
+
+// Get current voting state
+app.get("/voting-status", (req, res) => {
+  res.json({
+    votingActive,
+    countdown,
+  });
+});
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
