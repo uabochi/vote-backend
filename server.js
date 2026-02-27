@@ -6,6 +6,7 @@ require("dotenv").config();
 const User = require("./models/User");
 const Vote = require("./models/Vote");
 const Candidate = require("./models/Candidate");
+const VotingState = require("./models/VoteState");
 
 const app = express();
 app.use(cors());
@@ -14,7 +15,7 @@ app.use(express.json());
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Connected"))
-  .catch((err) => console.log(err));
+  .catch((err) => console.log("MongoDB Error:", err));
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -26,259 +27,194 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 5000;
 
-// ================= VOTING SESSION CONTROL =================
-let votingActive = false;
-let countdown = 0;
-let timerInterval = null;
-
-// GENERATE PASSWORD
+// PASSWORD GENERATOR
 function generatePassword(length = 14) {
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+";
-
   let password = "";
   for (let i = 0; i < length; i++) {
     password += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-
   return password;
 }
 
-/* ===========================
-   LOGIN
-=========================== */
+// LOGIN
 app.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
-
-    if (!username || !password) {
-      return res.status(400).json({ message: "Username and password required" });
-    }
 
     const user = await User.findOne({
       username: username.toUpperCase(),
     });
 
-    if (!user) {
-      return res.status(400).json({ message: "User not found" });
-    }
+    if (!user) return res.status(400).json({ message: "User not found" });
 
-    if (password !== user.password) {
+    if (password !== user.password)
       return res.status(400).json({ message: "Invalid password" });
-    }
 
     res.json({
       _id: user._id,
       username: user.username,
       role: user.role,
     });
-
   } catch (err) {
     console.error("LOGIN ERROR:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-/* ===========================
-   GET CANDIDATES
-=========================== */
+// CANDIDATES
 app.get("/candidates", async (req, res) => {
   const candidates = await Candidate.find();
   res.json(candidates);
 });
 
-/* ==============================
-   CHECK IF ALREADY VOTED FOR POSITION
-================================= */
-app.get("/vote-check", async (req, res) => {
-  const { username, position } = req.query;
+// VOTING STATUS
 
-  try {
-    const vote = await Vote.findOne({ username, position });
-    res.json({ voted: !!vote }); // true if vote exists, false otherwise
-  } catch (err) {
-    res.status(500).json({ error: "Server error" });
+app.get("/voting-status", async (req, res) => {
+  const state = await VotingState.findOne();
+
+  if (!state || !state.votingActive) {
+    return res.json({
+      votingActive: false,
+      endTime: null
+    });
   }
+
+  const remaining = state.endTime - Date.now();
+
+  if (remaining <= 0) {
+    state.votingActive = false;
+    state.endTime = null;
+    await state.save();
+
+    return res.json({
+      votingActive: false,
+      endTime: null
+    });
+  }
+
+  res.json({
+    votingActive: true,
+    endTime: state.endTime // ✅ send timestamp
+  });
 });
 
-/* ===========================
-   CAST VOTE
-=========================== */
+// START VOTING
+app.post("/start-voting", async (req, res) => {
+  const { duration } = req.body;
+
+  const endTime = Date.now() + duration * 1000;
+
+  let state = await VotingState.findOne();
+  if (!state) state = new VotingState();
+
+  state.votingActive = true;
+  state.endTime = endTime;
+
+  await state.save();
+
+  // 🔥 Emit to all clients
+  io.emit("voting-status", {
+    votingActive: true,
+    endTime: endTime
+  });
+
+  res.json({ message: "Voting started successfully" });
+});
+
+// STOP VOTING
+app.post("/stop-voting", async (req, res) => {
+  const state = await VotingState.findOne();
+
+  if (!state || !state.votingActive)
+    return res.status(400).json({ message: "Voting is not active" });
+
+  state.votingActive = false;
+  state.endTime = null;
+  await state.save();
+
+  // 🔥 Emit to all clients
+  io.emit("voting-ended");
+
+  res.json({ message: "Voting stopped successfully" });
+});
+
+// CAST VOTE
 app.post("/vote", async (req, res) => {
-  if (!votingActive) {
+  const { username, position, candidate } = req.body;
+
+  const state = await VotingState.findOne();
+
+  if (!state || !state.votingActive || state.endTime < Date.now()) {
     return res.status(400).json({ message: "Voting is not active" });
   }
 
-  const { username, position, candidate } = req.body;
-
   const existingVote = await Vote.findOne({ username, position });
-
   if (existingVote)
     return res.status(400).json({ message: "Already voted for this position" });
 
   const vote = new Vote({ username, position, candidate });
   await vote.save();
 
-  // Emit real-time update
-  const votes = await Vote.find();
-  io.emit("voteUpdated", votes);
-
   res.json({ message: "Vote casted successfully" });
 });
 
-/* ===========================
-   GET RESULTS
-=========================== */
+// GET RESULTS
 app.get("/results", async (req, res) => {
   const votes = await Vote.find();
-
   const results = {};
 
   votes.forEach((vote) => {
     if (!results[vote.position]) results[vote.position] = {};
     if (!results[vote.position][vote.candidate])
       results[vote.position][vote.candidate] = 0;
-
     results[vote.position][vote.candidate]++;
   });
 
   res.json(results);
 });
 
-/* ===========================
-   ADMIN - REMOVE VOTE
-=========================== */
-app.delete("/vote/:id", async (req, res) => {
-  await Vote.findByIdAndDelete(req.params.id);
-
-  // Emit real-time update
-  const votes = await Vote.find();
-  io.emit("voteUpdated", votes);
-
-  res.json({ message: "Vote removed" });
-});
-
-/* ===========================
-   ADMIN - USER MANAGEMENT
-=========================== */
-
-// Get users
+// USER MANAGEMENT
 app.get("/users", async (req, res) => {
   const users = await User.find();
   res.json(users);
 });
 
-// Create user
+// CREATE USER
 app.post("/users", async (req, res) => {
-  try {
-    const { username, role } = req.body;
+  const { username, role } = req.body;
 
-    if (!username) {
-      return res.status(400).json({ message: "Username is required" });
-    }
-
-    // Check if user already exists
-    const existingUser = await User.findOne({
-      username: username.toUpperCase(),
-    });
-
-    if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
-    }
-
-    // Generate password
-    const plainPassword = generatePassword();
-
-    // Create user
-    const newUser = new User({
-      username: username.toUpperCase(),
-      password: plainPassword,
-      role: role || "voter",
-    });
-
-    await newUser.save();
-
-    res.json({
-      message: "User created successfully",
-      generatedPassword: plainPassword, // send only once
-    });
-
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// Edit user
-app.put("/users/:id", async (req, res) => {
-  const updated = await User.findByIdAndUpdate(req.params.id, req.body, {
-    new: true,
+  const existingUser = await User.findOne({
+    username: username.toUpperCase(),
   });
-  res.json(updated);
+
+  if (existingUser)
+    return res.status(400).json({ message: "User already exists" });
+
+  const plainPassword = generatePassword();
+
+  const newUser = new User({
+    username: username.toUpperCase(),
+    password: plainPassword,
+    role: role || "voter",
+  });
+
+  await newUser.save();
+
+  res.json({
+    message: "User created successfully",
+    generatedPassword: plainPassword,
+  });
 });
 
-// Delete user
+// DELETE USER
 app.delete("/users/:id", async (req, res) => {
   await User.findByIdAndDelete(req.params.id);
   res.json({ message: "User deleted" });
 });
 
-// Start voting with timer
-app.post("/start-voting", (req, res) => {
-  const { duration } = req.body; // duration in seconds
-
-  if (votingActive) {
-    return res.status(400).json({ message: "Voting already active" });
-  }
-
-  votingActive = true;
-  countdown = duration;
-
-  io.emit("voting-status", { votingActive, countdown });
-
-  timerInterval = setInterval(() => {
-    countdown--;
-
-    io.emit("timer-update", { countdown });
-
-    if (countdown <= 0) {
-      clearInterval(timerInterval);
-      votingActive = false;
-      io.emit("voting-ended");
-    }
-  }, 1000);
-
-  res.json({ message: "Voting started" });
-});
-
-// Stop voting
-app.post("/stop-voting", (req, res) => {
-
-  if (!votingActive) {
-    return res.status(400).json({ message: "Voting is not active" });
-  }
-
-  // Stop the timer
-  clearInterval(timerInterval);
-
-  // Reset values
-  votingActive = false;
-  countdown = 0;
-
-  // Notify all connected clients
-  io.emit("voting-status", { votingActive, countdown });
-  io.emit("voting-ended");
-
-  res.json({ message: "Voting stopped successfully" });
-});
-
-// Get current voting state
-app.get("/voting-status", (req, res) => {
-  res.json({
-    votingActive,
-    countdown,
-  });
-});
-
+// START SERVER
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
